@@ -1,22 +1,28 @@
 # Figma Desktop Bridge
 
-A Figma plugin that bridges the Variables API and Component descriptions to MCP (Model Context Protocol) clients without requiring an Enterprise plan.
+A Figma plugin that bridges the Variables API and Component descriptions to MCP (Model Context Protocol) clients without requiring an Enterprise plan. Supports both local MCP servers and cloud relay connections from web-based AI clients.
 
 ## Overview
 
-This plugin enables AI assistants like Claude Code and Claude Desktop to access your Figma variables AND component descriptions through the MCP protocol. It bypasses both Figma's plugin sandbox restrictions and the REST API's component description bug.
+This plugin enables AI assistants to access your Figma variables AND component descriptions through the MCP protocol. It serves two purposes:
+
+- **Local MCP bridge** — Connects to a local MCP server via WebSocket on localhost (Claude Code, Claude Desktop, Cursor)
+- **Cloud relay bridge** — Connects to a cloud relay via WebSocket over TLS, enabling web-based AI clients (Claude.ai, v0, Replit, Lovable) to send write commands to Figma
+
+Both modes bypass Figma's plugin sandbox restrictions and the REST API's component description bug.
 
 ## Architecture
 
-**For Variables (pre-loaded):**
+The plugin communicates with MCP servers via WebSocket through two paths:
+
 ```
-Figma Plugin Worker → postMessage → Plugin UI Iframe → window object → Puppeteer → MCP Server
+LOCAL:  MCP Server ←WebSocket (ports 9223–9232)→ Plugin UI ←postMessage→ Plugin Worker → Figma API
+CLOUD:  Cloud MCP Server → Relay DO ←WebSocket (wss://)→ Plugin UI ←postMessage→ Plugin Worker → Figma API
 ```
 
-**For Components (on-demand):**
-```
-MCP Request → Plugin UI → postMessage → Plugin Worker → figma.getNodeByIdAsync() → Returns with description
-```
+For local mode, the server supports multi-instance operation — if port 9223 is already in use, it automatically falls back through ports 9224–9232. The plugin scans all ports and connects to every active server.
+
+For cloud mode, the plugin connects to a Cloudflare Durable Object relay via a one-time pairing code. Web-based AI clients send write commands through the relay to the plugin.
 
 **Key Features:**
 - ✅ No Enterprise plan required for variables
@@ -27,6 +33,11 @@ MCP Request → Plugin UI → postMessage → Plugin Worker → figma.getNodeByI
 - ✅ Persistent connection (stays open until closed)
 - ✅ Clean, minimal UI
 - ✅ Real-time data updates
+- ✅ WebSocket transport — no debug flags needed
+- ✅ Auto-reconnect on connection loss
+- ✅ Multi-instance: connects to all active MCP servers simultaneously (v1.10.0)
+- ✅ Cloud Mode: pair with web-based AI clients (Claude.ai, v0, Replit, Lovable)
+- ✅ Full write access from any MCP-capable web platform
 
 ## Installation
 
@@ -91,6 +102,29 @@ figma_get_component({
 
 **Important:** Keep the plugin running while querying. Variables are pre-loaded, but component data is fetched on-demand when requested.
 
+## Cloud Mode
+
+Cloud Mode lets web-based AI clients (Claude.ai, v0, Replit, Lovable) send write commands to your Figma file through a cloud relay. This enables the full suite of design creation and variable management tools from any MCP-capable web platform — no local Node.js required.
+
+### How to Connect
+
+1. **Start pairing from the AI client.** The AI client calls `figma_pair_plugin`, which generates a 6-character pairing code (valid for 5 minutes).
+2. **Open the Desktop Bridge plugin** in Figma Desktop.
+3. **Expand Cloud Mode.** Click the "Cloud Mode" toggle (chevron) below the status bar.
+4. **Enter the pairing code** in the text input and click **Connect**.
+5. The plugin establishes a WebSocket connection to the cloud relay. The status indicator changes to "Connected to cloud relay."
+
+### Disconnecting
+
+Click the **Disconnect** button in the Cloud Mode section, or close the plugin. The cloud relay session is terminated immediately.
+
+### Notes
+
+- **Both local and cloud connections can be active simultaneously.** Local MCP servers continue to work while Cloud Mode is connected.
+- **Pairing codes are single-use.** Each code can only be used once. If connection fails, generate a new code from the AI client.
+- **Codes expire in 5 minutes.** If the code has expired, ask the AI client to generate a fresh one.
+- **One plugin per relay session.** Each pairing code creates a dedicated relay instance scoped to that session.
+
 ## How It Works
 
 ### Plugin Worker (code.js)
@@ -123,17 +157,12 @@ figma_get_component({
 
 ### MCP Desktop Connector
 
-**Variables (getVariablesFromPluginUI):**
-1. Connects to Figma Desktop via remote debugging port (9222)
-2. Enumerates plugin UI iframes
-3. Checks for `window.__figmaVariablesData` availability
-4. Retrieves pre-loaded variables data
-
-**Components (getComponentFromPluginUI):**
-1. Connects to same Figma Desktop instance
-2. Finds iframe with `window.requestComponentData` function
-3. Calls function with nodeId parameter
-4. Returns Promise with component data including descriptions
+**WebSocket Path (Preferred):**
+1. MCP server starts WebSocket server on port 9223 (or next available port in range 9223–9232)
+2. Plugin UI connects as WebSocket client
+3. MCP server sends commands as JSON `{ id, method, params }`
+4. Plugin UI routes to the same `window.*` handlers
+5. Results sent back as `{ id, result }` or `{ id, error }`
 
 ## Troubleshooting
 
@@ -145,8 +174,7 @@ figma_get_component({
 ### "No plugin UI found with variables data" or "No plugin UI found with requestComponentData"
 - Ensure plugin is running (check for open plugin window showing "✓ Desktop Bridge active")
 - Try closing and reopening the plugin
-- Check browser console for errors
-- Verify Figma Desktop was launched with `--remote-debugging-port=9222`
+- Check browser console for errors (Plugins → Development → Open Console)
 
 ### Variables not updating
 - Close and reopen the plugin to refresh data
@@ -165,11 +193,55 @@ figma_get_component({
 - Verify nodeId format is correct
 - Timeout is set to 10 seconds - complex files may take longer
 
+### WebSocket connection not working
+- Verify the MCP server is running (it starts the WebSocket server on port 9223)
+- Check that the plugin is open in Figma — the WebSocket client is in the plugin UI
+- Check the browser console (Plugins > Development > Open Console) for `[MCP Bridge] WebSocket connected to port 9223`
+- As of v1.10.0, multiple MCP servers can run simultaneously on different ports (9223–9232). If tools aren't working on a fallback port, re-import the plugin manifest to enable multi-port scanning.
+- **Custom ports:** As of v1.10.0, the plugin scans ports 9223–9232 automatically. The `FIGMA_WS_PORT` env var sets the preferred starting port. Multi-instance support works out of the box within this range.
+
 ### Empty or outdated data
 - Plugin fetches variables on load - rerun plugin after making variable changes
 - Component data is fetched on-demand - always returns current state
 - Cache TTL is 5 minutes for variables - use `refreshCache: true` for immediate updates
 - Ensure you're in the correct file (plugin reads current file's data)
+
+### Cloud Mode shows "Connection failed"
+- The pairing code may have expired (codes are valid for 5 minutes). Generate a new one from the AI client.
+- Verify the code was entered correctly (6 characters, case-sensitive).
+
+### Cloud Mode disconnect button doesn't work
+- Close and reopen the Cloud Mode section, then try again.
+
+### Cloud connection drops between AI turns
+- Re-pair by generating a new pairing code from the AI client. The relay uses hibernation-safe patterns, but extended idle periods may cause reconnection. If it persists, generate a fresh code.
+
+## Multi-Instance Support (v1.10.0)
+
+The Desktop Bridge plugin supports connecting to **multiple MCP server instances** simultaneously. This is useful when:
+
+- **Claude Desktop** runs both Chat and Code tabs (each spawns a separate MCP server)
+- **Multiple CLI terminals** are running different projects with the MCP
+- **Claude Desktop + Claude Code CLI** are used together
+
+### How It Works
+
+1. The MCP server tries port 9223 first. If it's taken, it falls back to 9224, 9225, etc. (up to 9232)
+2. The plugin scans **all 10 ports** on startup and connects to every active server
+3. All events (selection changes, document changes, variables, console logs) are **broadcast to every connected server**
+4. Each server instance independently receives real-time data from Figma
+
+### Important: One-Time Plugin Update
+
+If you imported the Desktop Bridge plugin **before v1.10.0**, you need to re-import the manifest once to enable multi-port scanning:
+
+1. In Figma: **Plugins → Development → Import plugin from manifest...**
+2. Select the `manifest.json` file from the `figma-desktop-bridge` directory
+3. Run the plugin — it will now scan all ports and connect to all servers
+
+> **Why?** Figma caches plugin files at the application level. Simply restarting the plugin does NOT reload the code from disk. You must re-import the manifest to force Figma to pick up the new multi-port scanning logic.
+
+Without re-importing, the old plugin code only connects to port 9223. If your server fell back to a different port, the plugin won't find it.
 
 ## Development
 
@@ -211,10 +283,19 @@ View logs: **Plugins → Development → Open Console** (Cmd+Option+I on Mac)
 
 ## Security
 
-- Plugin requires **no network access** (allowedDomains: ["none"])
-- Data never leaves Figma Desktop
+**Local Mode:**
+- Plugin network access limited to `localhost` only (for WebSocket bridge)
+- Data never leaves the local machine
+- WebSocket bridge is local-only and unauthenticated — it relies on `localhost` binding for security. Multiple clients may be connected concurrently (one per Figma file). Do not expose the WebSocket port outside `localhost` (e.g., via port forwarding) on untrusted machines
+
+**Cloud Mode:**
+- Cloud relay connection uses TLS (`wss://`) for all traffic
+- Pairing codes are single-use and expire in 5 minutes — no unauthenticated access is possible
+- Each relay Durable Object is scoped per session (one plugin per relay instance)
+- The relay passes commands through without storing design data persistently
+
+**Both Modes:**
 - Uses standard Figma Plugin API (no unofficial APIs)
-- Read-only access (cannot modify variables or components)
 - Component requests are scoped to current file only
 
 ## Why Desktop Bridge for Components?

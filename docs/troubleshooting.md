@@ -1,32 +1,61 @@
+---
+title: "Troubleshooting"
+description: "Solutions to common issues including browser connection, console logs, screenshots, and configuration problems."
+---
+
 # Troubleshooting Guide
 
 ## Common Issues and Solutions
+
+### Issue: Claude Code OAuth Completes But Connection Fails
+
+**Symptoms:**
+- Using Claude Code with `claude mcp add --transport sse`
+- OAuth opens in browser and you authorize successfully
+- Connection never establishes after OAuth
+- Server shows "figma-console: not connected" in `/mcp`
+
+**Cause:**
+This is a [known bug in Claude Code's HTTP/SSE transport](https://github.com/anthropics/claude-code/issues/2466). The native SSE transport doesn't properly reconnect after completing the OAuth flow.
+
+**Solution:**
+Use the `mcp-remote` package instead of Claude Code's native SSE transport:
+
+```bash
+claude mcp add figma-console -s user -- npx -y mcp-remote@latest https://figma-console-mcp.southleft.com/sse
+```
+
+Or add to `~/.claude.json` manually:
+
+```json
+{
+  "mcpServers": {
+    "figma-console": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote@latest", "https://figma-console-mcp.southleft.com/sse"]
+    }
+  }
+}
+```
+
+Restart Claude Code (`/mcp` to reconnect) — mcp-remote will open a browser for OAuth, and the connection will work correctly.
+
+**Alternative:** If you're using Claude Code, consider using [Local Mode](/setup#local-mode-setup-advanced) instead. It provides the full feature set including the Desktop Bridge plugin, and doesn't require OAuth (uses a Personal Access Token).
+
+---
 
 ### Plugin Debugging: Simple Workflow ✅
 
 **For Plugin Developers in Local Mode:**
 
-> **🚨 CRITICAL FIRST-TIME SETUP:**
+> **FIRST-TIME SETUP:**
 >
-> **Step 1:** Quit Figma Desktop completely (Cmd+Q on macOS / Alt+F4 on Windows)
+> 1. Open Figma Desktop normally (no special flags needed)
+> 2. Go to **Plugins → Development → Import plugin from manifest...**
+> 3. Select `~/.figma-console-mcp/plugin/manifest.json` (stable path created automatically by the MCP server)
+> 4. Run the plugin in your Figma file — it auto-connects via WebSocket
 >
-> **Step 2:** Relaunch Figma with remote debugging enabled:
-> - **macOS:** Open Terminal and run:
->   ```bash
->   open -a "Figma" --args --remote-debugging-port=9222
->   ```
-> - **Windows:** Open Command Prompt and run:
->   ```bash
->   start figma://--remote-debugging-port=9222
->   ```
->
-> **Step 3:** Verify setup worked by visiting http://localhost:9222 in Chrome
-> - You should see a list of inspectable pages
-> - If you see this, the setup is correct!
->
-> **Step 4:** Open your design file and run your plugin
->
-> ✅ **You only need to do this once per Figma session.** Every time you quit Figma, you'll need to relaunch it with this command.
+> ✅ **One-time import.** The plugin uses a bootloader architecture that dynamically loads the latest UI from the MCP server each time it opens. You never need to re-import the manifest when the MCP server updates — the bootloader handles it automatically.
 
 ### How to Verify Setup is Working
 
@@ -36,17 +65,57 @@ Before trying to get console logs, verify your setup:
 "Check Figma status"
 ```
 
-You should see:
+You should see something like:
 ```json
 {
   "setup": {
     "valid": true,
-    "message": "✅ Figma Desktop is running with remote debugging enabled"
+    "message": "✅ Figma Desktop connected via WebSocket (Desktop Bridge Plugin)"
   }
 }
 ```
 
 If you see `"valid": false`, the AI will provide step-by-step setup instructions.
+
+---
+
+### WebSocket Bridge Troubleshooting
+
+#### Plugin Shows "Disconnected"
+**Cause:** MCP server is not running (it hosts the WebSocket server on ports 9223–9232).
+**Fix:** Start or restart your MCP client (Claude Code, Cursor, etc.) so the MCP server process starts.
+
+#### Plugin Not Appearing in Development Plugins
+**Cause:** Plugin manifest not imported.
+**Fix:** Go to Figma → Plugins → Development → Import plugin from manifest... → select `figma-desktop-bridge/manifest.json`.
+
+#### Port 9223 Already in Use
+**Cause:** Another MCP server instance or orphaned process is running on port 9223.
+**Fix:** As of v1.14.0, the server automatically cleans up orphaned MCP processes on startup and falls back to the next available port in the range 9223–9232. The bootloader plugin scans all ports automatically — no manual intervention needed.
+
+#### Plugin Shows "MCP scanning" or "Retry"
+**Cause:** The MCP server is not running yet, or all ports 9223–9232 are occupied.
+**Fix:** Start your MCP client (Claude Code, Cursor, etc.) so the MCP server process starts. If you have many stale processes holding ports, restart Claude Desktop to clear them — the next MCP server startup will clean up any remaining orphans automatically.
+
+#### Plugin Shows "No MCP server found"
+**Cause:** The bootloader scanned all ports and found no live MCP server.
+**Fix:** Make sure an MCP client is running with figma-console-mcp configured. Check `figma_get_status` from your AI client.
+
+#### Orphaned MCP Processes Filling Port Range
+**Cause:** Claude Desktop can leave orphaned MCP server processes running after tabs close (known Claude Desktop issue).
+**Fix:** As of v1.14.0, the server automatically detects and terminates orphaned figma-console-mcp processes on startup. If you need to manually clean up, run: `lsof -i :9223-9232 | grep LISTEN` to see what's holding ports.
+
+> **How the bootloader works:** The Desktop Bridge plugin uses a thin bootloader that dynamically loads the full plugin UI from the MCP server each time it opens. Figma caches the bootloader (which never needs updating), and the actual UI code is always fetched fresh from the running server. This eliminates the need to re-import the manifest when the MCP server updates.
+
+> **Stable plugin path:** The MCP server automatically copies plugin files to `~/.figma-console-mcp/plugin/` on startup. Import from this path instead of the volatile npx cache path.
+
+#### Running in Docker
+**Cause:** The WebSocket server binds to `localhost` by default, which is unreachable from the Docker host.
+**Fix:** Set `FIGMA_WS_HOST=0.0.0.0` in your container environment and expose the port with `-p 9223:9223`.
+
+#### Plugin Connected but Commands Timeout
+**Cause:** Plugin may be running in a different Figma file than expected.
+**Fix:** The MCP server routes commands to the active file. Make sure the Desktop Bridge Plugin is running in the file you want to work with. Use `figma_get_status` to see which file is connected.
 
 ---
 
@@ -411,7 +480,7 @@ If you're still experiencing issues:
 
 2. **Verify Deployment**
    ```bash
-   curl https://figma-console-mcp.southleft-llc.workers.dev/health
+   curl https://figma-console-mcp.southleft.com/health
    ```
 
 3. **Check Cloudflare Status**
@@ -449,7 +518,7 @@ If you're still experiencing issues:
 
 - **Size:** 1000 logs (configurable)
 - **Type:** Circular buffer (oldest logs dropped when full)
-- **Capture:** Real-time via Chrome DevTools Protocol
+- **Capture:** Real-time via WebSocket (Desktop Bridge Plugin)
 - **Source Detection:** Automatically identifies plugin vs Figma logs
 
 ### Screenshot Format

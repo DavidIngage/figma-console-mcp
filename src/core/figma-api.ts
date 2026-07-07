@@ -33,6 +33,77 @@ export function extractFileKey(url: string): string | null {
 }
 
 /**
+ * Information extracted from a Figma URL
+ * Includes file key, optional branch ID, and optional node ID
+ */
+export interface FigmaUrlInfo {
+  fileKey: string;
+  branchId?: string;
+  nodeId?: string;
+}
+
+/**
+ * Extract comprehensive URL info including branch and node IDs
+ * Supports both URL formats:
+ * - Path-based: /design/{fileKey}/branch/{branchKey}/{fileName}
+ * - Query-based: /design/{fileKey}/{fileName}?branch-id={branchId}
+ *
+ * @example https://www.figma.com/design/abc123/branch/xyz789/My-File?node-id=1-2
+ *   -> { fileKey: 'abc123', branchId: 'xyz789', nodeId: '1:2' }
+ * @example https://www.figma.com/design/abc123/My-File?branch-id=xyz789&node-id=1-2
+ *   -> { fileKey: 'abc123', branchId: 'xyz789', nodeId: '1:2' }
+ */
+export function extractFigmaUrlInfo(url: string): FigmaUrlInfo | null {
+  try {
+    const urlObj = new URL(url);
+
+    // First try: Path-based branch format /design/{fileKey}/branch/{branchKey}/{fileName}
+    const branchPathMatch = urlObj.pathname.match(/\/(design|file)\/([a-zA-Z0-9]+)\/branch\/([a-zA-Z0-9]+)/);
+    if (branchPathMatch) {
+      const fileKey = branchPathMatch[2];
+      const branchId = branchPathMatch[3];
+      const nodeIdParam = urlObj.searchParams.get('node-id');
+      const nodeId = nodeIdParam ? nodeIdParam.replace(/-/g, ':') : undefined;
+
+      return { fileKey, branchId, nodeId };
+    }
+
+    // Second try: Standard format /design/{fileKey}/{fileName} with optional ?branch-id=
+    const standardMatch = urlObj.pathname.match(/\/(design|file)\/([a-zA-Z0-9]+)/);
+    if (!standardMatch) return null;
+
+    const fileKey = standardMatch[2];
+    const branchId = urlObj.searchParams.get('branch-id') || undefined;
+    const nodeIdParam = urlObj.searchParams.get('node-id');
+    // Convert node-id from URL format (1-2) to Figma format (1:2)
+    const nodeId = nodeIdParam ? nodeIdParam.replace(/-/g, ':') : undefined;
+
+    return { fileKey, branchId, nodeId };
+  } catch (error) {
+    logger.error({ error, url }, 'Failed to extract Figma URL info');
+    return null;
+  }
+}
+
+/**
+ * Wrap a promise with a timeout
+ * @param promise The promise to wrap
+ * @param ms Timeout in milliseconds
+ * @param label Label for error message
+ * @returns Promise that rejects if timeout exceeded
+ */
+export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+    // Ensure timeout is cleared if promise resolves first
+    promise.finally(() => clearTimeout(timeoutId));
+  });
+  return Promise.race([promise, timeoutPromise]);
+}
+
+/**
  * Figma API Client
  * Makes authenticated requests to Figma REST API
  */
@@ -122,6 +193,53 @@ export class FigmaAPI {
     }
 
     return this.request(endpoint);
+  }
+
+  /**
+   * Resolve a branch key from a branch ID
+   * If branchId is provided, fetches branch data and returns the branch's unique key
+   * Otherwise returns the main file key unchanged
+   * @param fileKey The main file key from the URL
+   * @param branchId Optional branch ID from URL query param (branch-id)
+   * @returns The effective file key to use for API calls (branch key if on branch, otherwise fileKey)
+   */
+  async getBranchKey(fileKey: string, branchId?: string): Promise<string> {
+    if (!branchId) {
+      return fileKey;
+    }
+
+    try {
+      logger.info({ fileKey, branchId }, 'Resolving branch key');
+      const fileData = await this.getFile(fileKey, { branch_data: true });
+      const branches = fileData.branches || [];
+
+      // Try to find branch by key (branchId might already be the key)
+      // or by matching other identifiers
+      const branch = branches.find((b: { key?: string; name?: string }) =>
+        b.key === branchId || b.name === branchId
+      );
+
+      if (branch?.key) {
+        logger.info({ fileKey, branchId, branchKey: branch.key, branchName: branch.name }, 'Resolved branch key');
+        return branch.key;
+      }
+
+      // If branchId looks like a file key (alphanumeric), it might already be the branch key
+      // In this case, return it directly as it may be usable
+      if (/^[a-zA-Z0-9]+$/.test(branchId)) {
+        logger.info({ fileKey, branchId }, 'Branch ID appears to be a key, using directly');
+        return branchId;
+      }
+
+      logger.warn(
+        { fileKey, branchId, availableBranches: branches.map((b: { key?: string; name?: string }) => ({ key: b.key, name: b.name })) },
+        'Branch not found in file, using main file key'
+      );
+      return fileKey;
+    } catch (error) {
+      logger.error({ error, fileKey, branchId }, 'Failed to resolve branch key, using main file key');
+      return fileKey;
+    }
   }
 
   /**
@@ -243,19 +361,75 @@ export class FigmaAPI {
 	}
 
   /**
+   * GET /v1/files/:file_key/comments
+   * Get comments on a file
+   */
+  async getComments(fileKey: string, options?: { as_md?: boolean }): Promise<any> {
+    const params = new URLSearchParams();
+    if (options?.as_md) params.set('as_md', 'true');
+    const query = params.toString() ? `?${params.toString()}` : '';
+    return this.request(`/files/${fileKey}/comments${query}`);
+  }
+
+  /**
+   * POST /v1/files/:file_key/comments
+   * Post a comment on a file
+   */
+  async postComment(
+    fileKey: string,
+    message: string,
+    clientMeta?: { node_id?: string; node_offset?: { x: number; y: number } },
+    commentId?: string,
+  ): Promise<any> {
+    return this.request(`/files/${fileKey}/comments`, {
+      method: 'POST',
+      body: JSON.stringify({
+        message,
+        ...(clientMeta && { client_meta: clientMeta }),
+        ...(commentId && { comment_id: commentId }),
+      }),
+    });
+  }
+
+  /**
+   * DELETE /v1/files/:file_key/comments/:comment_id
+   * Delete a comment on a file
+   */
+  async deleteComment(fileKey: string, commentId: string): Promise<any> {
+    return this.request(`/files/${fileKey}/comments/${commentId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  /**
    * Helper: Get all design tokens (variables) with formatted output
+   * Both local and published can fail gracefully (e.g., 403 without Enterprise plan)
    */
   async getAllVariables(fileKey: string): Promise<{
     local: any;
     published: any;
+    localError?: string;
+    publishedError?: string;
   }> {
-    // Don't catch errors - let them bubble up so proper error messages are shown
-    const [local, published] = await Promise.all([
-      this.getLocalVariables(fileKey),
-      this.getPublishedVariables(fileKey).catch(() => ({ variables: {} })), // Published can fail gracefully
+    // Wrap both in catch handlers to prevent unhandled promise rejections
+    // which can crash the server when REST API returns 403
+    const [localResult, publishedResult] = await Promise.all([
+      this.getLocalVariables(fileKey).catch((err) => {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return { error: errorMsg, variables: {}, variableCollections: {} };
+      }),
+      this.getPublishedVariables(fileKey).catch((err) => {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return { error: errorMsg, variables: {} };
+      }),
     ]);
 
-    return { local, published };
+    return {
+      local: 'error' in localResult ? { meta: { variables: {}, variableCollections: {} } } : localResult,
+      published: 'error' in publishedResult ? { variables: {} } : publishedResult,
+      ...(('error' in localResult) && { localError: localResult.error }),
+      ...(('error' in publishedResult) && { publishedError: publishedResult.error }),
+    };
   }
 
   /**
