@@ -142,24 +142,32 @@ export class EnrichmentService {
 					...variable,
 				};
 
-				// Resolve values for all modes
+				// Resolve values for all modes — each mode must resolve ITS OWN
+				// value, so the modeId is threaded through the resolver (which
+				// also keys its cache per mode).
 				if (options.include_exports !== false) {
 					const resolved_values: Record<string, any> = {};
-					for (const [modeId, value] of Object.entries(
-						variable.valuesByMode || {},
-					)) {
+					for (const modeId of Object.keys(variable.valuesByMode || {})) {
 						const resolvedValue = await this.styleResolver.resolveVariableValue(
 							variable,
 							variablesMap,
 							options.max_depth,
+							0,
+							modeId,
 						);
 						resolved_values[modeId] = resolvedValue;
 					}
 					enriched.resolved_values = resolved_values;
 
-					// Generate export formats using first mode
+					// Generate export formats using first mode. Guard only against
+					// null/undefined — legitimate falsy values (0, false, "") must
+					// still produce export formats.
 					const firstModeValue = Object.values(resolved_values)[0];
-					if (firstModeValue && options.export_formats) {
+					if (
+						firstModeValue !== null &&
+						firstModeValue !== undefined &&
+						options.export_formats
+					) {
 						enriched.export_formats = this.styleResolver.generateExportFormats(
 							variable.name,
 							firstModeValue,
@@ -244,22 +252,120 @@ export class EnrichmentService {
 				enriched.styles_used = stylesUsed;
 			}
 
-			// Extract variables used
-			if (component.boundVariables) {
-				const varsUsed: any[] = [];
-				// This would need actual variable resolution
-				enriched.variables_used = varsUsed;
-			}
+			// Extract variables used and detect hardcoded values by walking the node tree
+			const varsUsed: any[] = [];
+			const hardcodedValues: any[] = [];
+			const variables = this.extractVariablesMap(data);
 
-			// Detect hardcoded values (simplified for now)
-			// TODO: Implement full hardcoded value detection
-			enriched.hardcoded_values = [];
+			// Walk node tree to find boundVariables and hardcoded values
+			const walkForTokens = (node: any, path: string = "") => {
+				if (!node) return;
+				const nodePath = path ? `${path} > ${node.name || node.id}` : (node.name || node.id);
+
+				const bv = node.boundVariables || {};
+
+				// Check fills
+				if (node.fills && Array.isArray(node.fills)) {
+					for (let i = 0; i < node.fills.length; i++) {
+						const fill = node.fills[i];
+						if (fill.type === "SOLID" && fill.visible !== false) {
+							const fillBv = bv.fills;
+							if (fillBv && (Array.isArray(fillBv) ? fillBv[i] : fillBv)) {
+								const varRef = Array.isArray(fillBv) ? fillBv[i] : fillBv;
+								if (varRef?.id) {
+									const varInfo = variables.get(varRef.id);
+									varsUsed.push({
+										variableId: varRef.id,
+										variableName: varInfo?.name || varRef.id,
+										property: "fill",
+										nodePath,
+									});
+								}
+							} else {
+								// Hardcoded fill
+								const c = fill.color;
+								if (c) {
+									hardcodedValues.push({
+										property: "fill",
+										value: `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`,
+										nodePath,
+									});
+								}
+							}
+						}
+					}
+				}
+
+				// Check strokes
+				if (node.strokes && Array.isArray(node.strokes)) {
+					for (let i = 0; i < node.strokes.length; i++) {
+						const stroke = node.strokes[i];
+						if (stroke.type === "SOLID" && stroke.visible !== false) {
+							const strokeBv = bv.strokes;
+							if (strokeBv && (Array.isArray(strokeBv) ? strokeBv[i] : strokeBv)) {
+								const varRef = Array.isArray(strokeBv) ? strokeBv[i] : strokeBv;
+								if (varRef?.id) {
+									const varInfo = variables.get(varRef.id);
+									varsUsed.push({
+										variableId: varRef.id,
+										variableName: varInfo?.name || varRef.id,
+										property: "stroke",
+										nodePath,
+									});
+								}
+							} else {
+								const c = stroke.color;
+								if (c) {
+									hardcodedValues.push({
+										property: "stroke",
+										value: `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`,
+										nodePath,
+									});
+								}
+							}
+						}
+					}
+				}
+
+				// Check spacing/sizing tokens
+				const spacingProps = ["itemSpacing", "paddingLeft", "paddingRight", "paddingTop", "paddingBottom", "cornerRadius"];
+				for (const prop of spacingProps) {
+					if (node[prop] !== undefined && node[prop] !== 0) {
+						if (bv[prop]?.id) {
+							const varInfo = variables.get(bv[prop].id);
+							varsUsed.push({
+								variableId: bv[prop].id,
+								variableName: varInfo?.name || bv[prop].id,
+								property: prop,
+								nodePath,
+							});
+						} else {
+							hardcodedValues.push({
+								property: prop,
+								value: node[prop],
+								nodePath,
+							});
+						}
+					}
+				}
+
+				// Recurse into children
+				if (node.children && Array.isArray(node.children)) {
+					for (const child of node.children) {
+						walkForTokens(child, nodePath);
+					}
+				}
+			};
+
+			walkForTokens(component);
+			enriched.variables_used = varsUsed;
+			enriched.hardcoded_values = hardcodedValues;
 
 			// Calculate token coverage
-			const totalProps = (enriched.styles_used?.length || 0) + (enriched.variables_used?.length || 0) + (enriched.hardcoded_values?.length || 0);
-			const tokenProps = (enriched.styles_used?.length || 0) + (enriched.variables_used?.length || 0);
+			const totalProps = varsUsed.length + (enriched.styles_used?.length || 0) + hardcodedValues.length;
+			const tokenProps = varsUsed.length + (enriched.styles_used?.length || 0);
 			enriched.token_coverage =
-				totalProps > 0 ? Math.round((tokenProps / totalProps) * 100) : 0;
+				totalProps > 0 ? Math.round((tokenProps / totalProps) * 100) : 100;
 
 			this.logger.info(
 				{ componentId: component.id, coverage: enriched.token_coverage },

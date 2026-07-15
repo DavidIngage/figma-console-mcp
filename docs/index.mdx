@@ -1,10 +1,10 @@
 ---
 title: "Figma Console MCP"
-description: "Your design system as an API. Connect AI to Figma for extraction, creation, and debugging."
+description: "Your design system as an API. Connect AI to Figma for extraction, creation, debugging, and token sync."
 ---
 
 <Note>
-**New in v1.17.0 — AI Across All Figma Products:** Figma Console MCP now supports **FigJam boards** and **Figma Slides** alongside Figma Design files. Create stickies, flowcharts, and tables on whiteboards. Manage entire presentations — slides, transitions, and content. 24 new tools, 78+ total. [FigJam Guide →](/figjam) | [Slides Guide →](/slides)
+**New in v1.35.0 — Figma Slots Support:** Create, inspect, populate, and reset Figma Slots (GA at Config 2026) programmatically. `figma_create_slot` adds slots to components — variants included — with the linked SLOT property created automatically; `figma_append_to_slot` populates instance slots with cloned or newly created content (the path Figma requires — `setProperties` rejects slot values by design); plus `figma_get_slots`, `figma_reset_slot`, and `figma_add_slot_property`. Live-validated against the GA Plugin API. Closes [#29](https://github.com/southleft/figma-console-mcp/issues/29), based on community PR [#77](https://github.com/southleft/figma-console-mcp/pull/77). **Plugin re-import required** (`code.js` + `ui.html` changed). [See what's new →](https://github.com/southleft/figma-console-mcp/blob/main/CHANGELOG.md#1350---2026-07-09)
 </Note>
 
 # Your Design System as an API
@@ -13,15 +13,18 @@ Design systems shouldn't be static documents locked in a visual tool. They shoul
 
 Figma Console MCP bridges the gap between design and development—giving AI assistants complete access to your Figma files for extraction, creation, and debugging.
 
-<Columns cols={3}>
+<Columns cols={4}>
   <Card title="Extract" icon="download">
     Variables, styles, and components as structured data
+  </Card>
+  <Card title="Sync" icon="arrows-rotate">
+    Bidirectional token sync between Figma and your codebase
   </Card>
   <Card title="Create" icon="wand-magic-sparkles">
     Design files, FigJam boards, and Slides presentations
   </Card>
-  <Card title="Debug" icon="bug">
-    Real-time console logs from your plugins
+  <Card title="Audit" icon="universal-access">
+    Accessibility scanning across design and code
   </Card>
 </Columns>
 
@@ -120,6 +123,15 @@ Real component data. Real token values. Real code that uses your actual design s
     - `figma_get_design_system_summary` — Overview of entire system
   </Accordion>
 
+  <Accordion title="Shared Library Inspection" icon="book">
+    Inspect components and variables from team libraries the current file has subscribed — without needing the library file's URL or an Enterprise plan.
+
+    - `figma_get_library_component_by_key` — **Resolve any component key to full props + variants + visual specs.** Tries `/v1/component_sets/{key}` then falls back to `/v1/components/{key}`. Returns `componentPropertyDefinitions`, every variant with its published key, and per-variant visual specs.
+    - `figma_get_library_components` — Discover all components in a library file (requires the library file URL/key)
+    - `figma_get_library_variables` — **List library tokens.** Plugin API path works on every Figma plan; filter by `libraryName`, `collectionName`, or `resolvedType`.
+    - `figma_import_library_variable` — Import a library variable into the current file. Returns a local `id` ready for `figma_set_fills` or any variable-binding tool.
+  </Accordion>
+
   <Accordion title="Plugin Debugging" icon="terminal">
     Real-time console log capture from your Figma plugins. No more console.log archaeology.
 
@@ -132,9 +144,19 @@ Real component data. Real token values. Real code that uses your actual design s
     Execute Figma Plugin API code directly. Build, modify, and organize components programmatically.
 
     - `figma_execute` — Run any Plugin API code
+    - `figma_create_component_set` — Build a full variant set from an axes matrix (or combine existing components) in one call — variant keys returned, ready to instantiate
     - `figma_arrange_component_set` — Organize variants with labels
+    - `figma_create_slot` / `figma_append_to_slot` — Add slots to components and populate them on instances (Figma Slots, GA at Config 2026), plus `figma_get_slots`, `figma_reset_slot`, and `figma_add_slot_property`
     - `figma_create_variable` — Add design tokens
     - Plus 20+ node manipulation tools
+  </Accordion>
+
+  <Accordion title="Token Sync" icon="arrows-rotate">
+    Bidirectional design token synchronization — a full code⇄Figma round-trip that replaces Style Dictionary and Tokens Studio's export pipeline.
+
+    - `figma_export_tokens` — Export variables to DTCG JSON (legacy hex or DTCG 2025.10 object dialect via `dtcgDialect`), CSS custom properties, Tailwind v4/v3, SCSS, TypeScript, JSON, Style Dictionary v3, or Tokens Studio. Round-trip safe via `$extensions["figma-console-mcp"]`; scopes and codeSyntax metadata included.
+    - `figma_import_tokens` — Push code-side edits back with a **full apply phase**: value updates, creates for missing collections/variables, renames matched by variable ID, real `VARIABLE_ALIAS` writes, and deletes gated strictly behind `strategy: "replace"`. Accepts both DTCG dialects; dry-run previews.
+    - `figma_setup_design_tokens` — Bootstrap a collection + modes + variables atomically, with alias values via DTCG brace references (`"{color.blue.600}"`)
   </Accordion>
 
   <Accordion title="Visual Context" icon="image">
@@ -168,6 +190,17 @@ Real component data. Real token values. Real code that uses your actual design s
 
     [Full Slides Guide →](/slides)
   </Accordion>
+
+  <Accordion title="Accessibility Scanning" icon="universal-access">
+    Full-spectrum WCAG coverage across design and code:
+
+    - **Design-side lint** — 14 WCAG checks with AA/best-practice level tagging: contrast, non-text contrast, color-only, focus indicators, disabled context, spacing, alt text, heading hierarchy, reflow, reading order, token misuse
+    - **Component audit** — State coverage scoring, focus indicator quality, color-blind simulation (protanopia, deuteranopia, tritanopia)
+    - **Code-side scan** — axe-core with 104 rules via JSDOM: ARIA, labels, landmarks, semantics, headings
+    - **Parity bridge** — 9 checks ensuring design accessibility intent survives code implementation
+
+    [Full Accessibility Guide →](/tools#-accessibility-tools)
+  </Accordion>
 </AccordionGroup>
 
 ---
@@ -176,17 +209,17 @@ Real component data. Real token values. Real code that uses your actual design s
 
 <Columns cols={3}>
   <Card title="NPX Setup (Recommended)" icon="bolt" href="/setup#-npx-setup-recommended">
-    **Full capabilities — 84+ tools**
+    **Full capabilities — 112 tools**
 
     All tools including real-time monitoring. Requires Node.js and a Figma token.
   </Card>
   <Card title="Cloud Mode" icon="cloud-arrow-up" href="/setup#-cloud-mode-web-ai-clients">
-    **Web AI clients — 76 tools**
+    **Web AI clients — 101 tools**
 
     Full write access from Claude.ai, v0, Replit, or Lovable. Pair with a code — no Node.js needed.
   </Card>
   <Card title="Remote (Read-Only)" icon="cloud" href="/setup#-remote-mode-read-only-exploration">
-    **Quick exploration — 76 tools**
+    **Quick exploration — 9 tools**
 
     Zero setup, just paste a URL. Read design data and take screenshots.
   </Card>
@@ -244,7 +277,7 @@ Real component data. Real token values. Real code that uses your actual design s
     Real scenarios and workflows
   </Card>
   <Card title="All Tools" icon="wrench" href="/tools">
-    Complete reference for 84+ tools
+    Complete reference for 112 tools
   </Card>
   <Card title="Troubleshooting" icon="circle-question" href="/troubleshooting">
     Common issues and solutions

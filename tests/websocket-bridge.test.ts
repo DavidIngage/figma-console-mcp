@@ -2,9 +2,9 @@
  * WebSocket Bridge Tests
  *
  * Tests for:
- * - FigmaWebSocketServer: lifecycle, command routing, reconnection
+ * - FigmaWebSocketServer: lifecycle, command routing, reconnection,
+ *   multi-client file identity, console/document/selection/page change buffering
  * - WebSocketConnector: IFigmaConnector implementation, method mapping
- * - Transport detection: CDP vs WebSocket fallback logic
  */
 
 import { FigmaWebSocketServer } from '../src/core/websocket-server';
@@ -21,7 +21,7 @@ jest.setTimeout(10000);
 function connectClient(
   server: FigmaWebSocketServer,
   port: number,
-  fileInfo?: { fileKey: string; fileName: string; currentPage?: string }
+  fileInfo?: { fileKey: string; fileName: string; currentPage?: string; pluginVersion?: string }
 ): Promise<WebSocket> {
   const info = fileInfo || { fileKey: 'test-file-key', fileName: 'Test File', currentPage: 'Page 1' };
   return new Promise((resolve, reject) => {
@@ -148,6 +148,85 @@ describe('FigmaWebSocketServer', () => {
       const client2 = await connectClient(server, TEST_PORT);
       clients.push(client2);
       expect(server.isClientConnected()).toBe(true);
+    });
+  });
+
+  describe('plugin version handshake', () => {
+    // Regression for the v1.33.1 false positive: the handshake must compare
+    // the plugin's reported version against the BUNDLED plugin files' version
+    // (what a manifest re-import installs), never against the server's
+    // package version — server-only releases bump the package without
+    // touching plugin files. bundledPluginVersion is injected here at a value
+    // that cannot match package.json, so any comparison against the server
+    // version would fail these tests.
+    const BUNDLED = '9.9.9';
+
+    /** Collect messages of a given type arriving on the client. */
+    function collectMessages(ws: WebSocket, type: string): any[] {
+      const seen: any[] = [];
+      ws.on('message', (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString());
+          if (msg.type === type) seen.push(msg);
+        } catch { /* ignore */ }
+      });
+      return seen;
+    }
+
+    const settle = () => new Promise((r) => setTimeout(r, 150));
+
+    test('plugin matching the bundled plugin version is NOT flagged stale (server-only release)', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT, bundledPluginVersion: BUNDLED });
+      await server.start();
+
+      const ws = new WebSocket(`ws://localhost:${TEST_PORT}`);
+      const updateMsgs = collectMessages(ws, 'PLUGIN_UPDATE_AVAILABLE');
+      const connected = new Promise<void>((res) => server.once('connected', res));
+      await new Promise<void>((res) => ws.on('open', () => res()));
+      ws.send(JSON.stringify({
+        type: 'FILE_INFO',
+        data: { fileKey: 'vh-file', fileName: 'Version Test', pluginVersion: BUNDLED },
+      }));
+      await connected;
+      clients.push(ws);
+      await settle();
+
+      expect(server.getConnectedFileInfo()?.pluginVersion).toBe(BUNDLED);
+      expect(server.getConnectedFileInfo()?.pluginUpdateAvailable).toBe(false);
+      expect(updateMsgs).toHaveLength(0);
+    });
+
+    test('plugin older than the bundled plugin version IS flagged and notified', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT, bundledPluginVersion: BUNDLED });
+      await server.start();
+
+      const ws = new WebSocket(`ws://localhost:${TEST_PORT}`);
+      const updateMsgs = collectMessages(ws, 'PLUGIN_UPDATE_AVAILABLE');
+      const connected = new Promise<void>((res) => server.once('connected', res));
+      await new Promise<void>((res) => ws.on('open', () => res()));
+      ws.send(JSON.stringify({
+        type: 'FILE_INFO',
+        data: { fileKey: 'vh-file', fileName: 'Version Test', pluginVersion: '9.9.8' },
+      }));
+      await connected;
+      clients.push(ws);
+      await settle();
+
+      expect(server.getConnectedFileInfo()?.pluginUpdateAvailable).toBe(true);
+      expect(updateMsgs).toHaveLength(1);
+      expect(updateMsgs[0].bundledPluginVersion).toBe(BUNDLED);
+      expect(updateMsgs[0].pluginVersion).toBe('9.9.8');
+    });
+
+    test('plugin reporting no version is flagged stale', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT, bundledPluginVersion: BUNDLED });
+      await server.start();
+
+      const client = await connectClient(server, TEST_PORT); // helper sends no pluginVersion
+      clients.push(client);
+
+      expect(server.getConnectedFileInfo()?.pluginVersion).toBeNull();
+      expect(server.getConnectedFileInfo()?.pluginUpdateAvailable).toBe(true);
     });
   });
 
@@ -986,20 +1065,13 @@ describe('FigmaWebSocketServer console capture', () => {
 // ============================================================================
 
 describe('IFigmaConnector interface compliance', () => {
-  test('FigmaDesktopConnector has getTransportType returning cdp', async () => {
-    const mod = await import('../src/core/figma-desktop-connector');
-    expect(mod.FigmaDesktopConnector.prototype.getTransportType).toBeDefined();
-    const result = mod.FigmaDesktopConnector.prototype.getTransportType();
-    expect(result).toBe('cdp');
-  });
-
   test('WebSocketConnector has getTransportType returning websocket', () => {
     const mockServer = { isClientConnected: () => false } as any;
     const connector = new WebSocketConnector(mockServer);
     expect(connector.getTransportType()).toBe('websocket');
   });
 
-  test('Both connectors implement all IFigmaConnector methods', async () => {
+  test('WebSocketConnector implements all IFigmaConnector methods', () => {
     const interfaceMethods = [
       'initialize', 'getTransportType', 'executeInPluginContext',
       'getVariablesFromPluginUI', 'getVariables', 'executeCodeViaUI',
@@ -1009,6 +1081,7 @@ describe('IFigmaConnector interface compliance', () => {
       'deleteVariableCollection', 'getComponentFromPluginUI',
       'getLocalComponents', 'setNodeDescription', 'addComponentProperty',
       'editComponentProperty', 'deleteComponentProperty',
+      'createSlot', 'getSlots', 'appendToSlot', 'resetSlot',
       'instantiateComponent', 'resizeNode', 'moveNode',
       'setNodeFills', 'setNodeStrokes', 'setNodeOpacity',
       'setNodeCornerRadius', 'cloneNode', 'deleteNode',
@@ -1016,17 +1089,10 @@ describe('IFigmaConnector interface compliance', () => {
       'captureScreenshot', 'setInstanceProperties', 'clearFrameCache',
     ];
 
-    // Check WebSocketConnector
     const mockServer = { isClientConnected: () => false } as any;
     const wsConnector = new WebSocketConnector(mockServer);
     for (const method of interfaceMethods) {
       expect(typeof (wsConnector as any)[method]).toBe('function');
-    }
-
-    // Check FigmaDesktopConnector prototype
-    const mod = await import('../src/core/figma-desktop-connector');
-    for (const method of interfaceMethods) {
-      expect(typeof mod.FigmaDesktopConnector.prototype[method]).toBe('function');
     }
   });
 });
@@ -1850,6 +1916,98 @@ describe('Multi-client WebSocket', () => {
       expect(typeof hello.serverVersion).toBe('string');
       expect(hello.serverVersion).toMatch(/^\d+\.\d+\.\d+/);
       expect(typeof hello.startedAt).toBe('number');
+    });
+  });
+
+  // ==========================================================================
+  // Heartbeat (ping/pong) Tests
+  // ==========================================================================
+
+  describe('Heartbeat', () => {
+    it('should set isAlive on new connections', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT });
+      await server.start();
+      const ws = await connectClient(server, TEST_PORT);
+      clients.push(ws);
+
+      // The pong handler should have been registered, and isAlive set
+      // Verify via isClientConnected (which checks lastPongAt freshness)
+      expect(server.isClientConnected()).toBe(true);
+    });
+
+    it('should track lastPongAt on client connections', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT });
+      await server.start();
+      const ws = await connectClient(server, TEST_PORT);
+      clients.push(ws);
+
+      // lastPongAt should be set to approximately now
+      const lastPong = server.getActiveClientLastPongAt();
+      expect(lastPong).not.toBeNull();
+      expect(Date.now() - lastPong!).toBeLessThan(5000);
+    });
+
+    it('should respond to pongs and update lastPongAt', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT });
+      await server.start();
+      const ws = await connectClient(server, TEST_PORT);
+      clients.push(ws);
+
+      const initialPong = server.getActiveClientLastPongAt()!;
+
+      // ws library clients auto-respond to pings with pongs (autoPong defaults to true).
+      // Send a message to trigger lastActivity, then verify lastPongAt is still valid.
+      ws.send(JSON.stringify({ type: 'FILE_INFO', data: { fileKey: 'test-file-key', fileName: 'Test File', currentPage: 'Page 1' } }));
+      await new Promise(r => setTimeout(r, 50));
+
+      const laterPong = server.getActiveClientLastPongAt()!;
+      expect(laterPong).toBeGreaterThanOrEqual(initialPong);
+    });
+
+    it('should clean up heartbeat interval on stop', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT });
+      await server.start();
+
+      // Stop should clean up the interval without errors
+      await server.stop();
+
+      // Server should be stopped cleanly
+      expect(server.isStarted()).toBe(false);
+    });
+
+    it('should report lastPongAt as null when no client connected', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT });
+      await server.start();
+
+      expect(server.getActiveClientLastPongAt()).toBeNull();
+    });
+  });
+
+  // ==========================================================================
+  // Health Endpoint Tests
+  // ==========================================================================
+
+  describe('Health endpoint', () => {
+    it('should include connectedClients in health response', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT });
+      await server.start();
+
+      // No clients connected
+      const res1 = await fetch(`http://localhost:${TEST_PORT}/health`);
+      const data1 = await res1.json();
+      expect(data1.status).toBe('ok');
+      expect(data1.clients).toBe(0);
+      expect(data1.connectedClients).toBe(0);
+      expect(typeof data1.uptime).toBe('number');
+
+      // Connect a client
+      const ws = await connectClient(server, TEST_PORT);
+      clients.push(ws);
+
+      const res2 = await fetch(`http://localhost:${TEST_PORT}/health`);
+      const data2 = await res2.json();
+      expect(data2.clients).toBe(1);
+      expect(data2.connectedClients).toBe(1);
     });
   });
 });

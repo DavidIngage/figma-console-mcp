@@ -31,37 +31,9 @@ const enrichmentService = new EnrichmentService(logger);
 // Shared Helpers
 // ============================================================================
 
-/** Convert Figma RGBA (0-1 floats) to hex string */
-export function figmaRGBAToHex(color: { r: number; g: number; b: number; a?: number }): string {
-	const r = Math.round(color.r * 255);
-	const g = Math.round(color.g * 255);
-	const b = Math.round(color.b * 255);
-	const hex = `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`.toUpperCase();
-	if (color.a !== undefined && color.a < 1) {
-		const a = Math.round(color.a * 255);
-		return `${hex}${a.toString(16).padStart(2, "0")}`;
-	}
-	return hex;
-}
-
-/** Normalize a color string for comparison (uppercase hex without alpha if fully opaque) */
-export function normalizeColor(color: string): string {
-	let c = color.trim().toUpperCase();
-	// Strip alpha if fully opaque (FF)
-	if (c.length === 9 && c.endsWith("FF")) {
-		c = c.slice(0, 7);
-	}
-	// Expand shorthand (#RGB -> #RRGGBB)
-	if (/^#[0-9A-F]{3}$/.test(c)) {
-		c = `#${c[1]}${c[1]}${c[2]}${c[2]}${c[3]}${c[3]}`;
-	}
-	return c;
-}
-
-/** Compare numeric values with a tolerance */
-export function numericClose(a: number, b: number, tolerance: number = 1): boolean {
-	return Math.abs(a - b) <= tolerance;
-}
+// Re-exported from the shared diff module so existing imports continue to work.
+export { figmaRGBAToHex, normalizeColor, numericClose } from "./diff/property-compare.js";
+import { figmaRGBAToHex, normalizeColor, numericClose } from "./diff/property-compare.js";
 
 /** Calculate parity score from discrepancy counts */
 export function calculateParityScore(critical: number, major: number, minor: number, info: number): number {
@@ -258,7 +230,7 @@ export function parseComponentDescription(description: string): ParsedDescriptio
 		const trimmed = line.trim();
 
 		// Detect section headers: bold text (**Header**), markdown headers (## Header), or plain text exact matches
-		const markdownHeaderMatch = trimmed.match(/^(?:\*\*|###?\s*)(.+?)(?:\*\*)?$/);
+		const markdownHeaderMatch = trimmed.match(/^(?:\*\*|#{1,6}\s*)(.+?)(?:\*\*)?$/);
 		const headerText = markdownHeaderMatch ? markdownHeaderMatch[1].trim().replace(/\*\*/g, "") : null;
 
 		// Check if this is a Figma per-property documentation block (e.g., "Show Left Icon: True – Purpose")
@@ -625,7 +597,7 @@ function buildAnatomyLines(
 /**
  * Collect spacing tokens with their bound variable names.
  */
-function collectSpacingTokens(node: any): Array<{
+function collectSpacingTokens(node: any, varNameMap: Map<string, string> = new Map()): Array<{
 	property: string;
 	value: number;
 	variableName?: string;
@@ -647,7 +619,12 @@ function collectSpacingTokens(node: any): Array<{
 		const value = node[key];
 		if (value !== undefined && value !== null) {
 			const varBinding = boundVars[key];
-			const varName = varBinding?.id || varBinding?.name;
+			// Bound spacing variables expose their id as boundVariables[key].id.
+			// Resolve it to a friendly token name (e.g. `spacing/1`) when the caller
+			// supplied a name map; fall back to the raw id so the binding stays visible.
+			const varId: string | undefined =
+				typeof varBinding?.id === "string" ? varBinding.id : undefined;
+			const varName = varId ? varNameMap.get(varId) || varId : undefined;
 			tokens.push({
 				property: label,
 				value,
@@ -1043,21 +1020,27 @@ function compareTokens(
 		}
 	}
 
-	// Cross-reference design variables with code tokens
+	// Cross-reference design variables with code tokens.
+	// enrichment entries key off variableName (NOT name); reading `.name` here left
+	// every comparison undefined (and would throw on .toLowerCase()). Use variableName
+	// and skip any entries that never resolved to a real token name.
 	if (enrichedData.variables_used && ct.usedTokens) {
-		const designTokenNames = enrichedData.variables_used.map((v) => v.name.toLowerCase());
+		const designTokens = (enrichedData.variables_used as any[])
+			.map((v) => v.variableName)
+			.filter((n): n is string => typeof n === "string" && n.length > 0);
+		const designTokenNames = designTokens.map((n) => n.toLowerCase());
 		const codeTokenNames = ct.usedTokens.map((t) => t.toLowerCase());
 
-		for (const designToken of enrichedData.variables_used) {
-			const normalizedName = designToken.name.toLowerCase();
+		for (const tokenName of designTokens) {
+			const normalizedName = tokenName.toLowerCase();
 			if (!codeTokenNames.some((ct) => ct.includes(normalizedName) || normalizedName.includes(ct))) {
 				discrepancies.push({
 					category: "tokens",
-					property: `token:${designToken.name}`,
+					property: `token:${tokenName}`,
 					severity: "minor",
-					designValue: designToken.name,
+					designValue: tokenName,
 					codeValue: null,
-					message: `Design uses token "${designToken.name}" but code doesn't reference it`,
+					message: `Design uses token "${tokenName}" but code doesn't reference it`,
 					suggestion: `Add token reference in code`,
 				});
 			}
@@ -1177,8 +1160,10 @@ function compareAccessibility(node: any, codeSpec: CodeSpec, discrepancies: Pari
 
 	// Check description/annotations for accessibility hints
 	const description = node.descriptionMarkdown || node.description || "";
-	const hasAriaAnnotation = description.toLowerCase().includes("aria") || description.toLowerCase().includes("accessibility");
+	const descLower = description.toLowerCase();
+	const hasAriaAnnotation = descLower.includes("aria") || descLower.includes("accessibility");
 
+	// ---- 1. ARIA Role Parity ----
 	if (ca.role && !hasAriaAnnotation) {
 		discrepancies.push({
 			category: "accessibility",
@@ -1191,6 +1176,38 @@ function compareAccessibility(node: any, codeSpec: CodeSpec, discrepancies: Pari
 		});
 	}
 
+	// ---- 2. Semantic Element vs Component Name ----
+	if (ca.semanticElement) {
+		const nodeName = (node.name || "").toLowerCase();
+		const element = ca.semanticElement.toLowerCase();
+		// Check if interactive component uses correct semantic element
+		const interactivePattern = /button|link|input|checkbox|radio|switch|toggle|tab|select/i;
+		if (interactivePattern.test(nodeName)) {
+			const elementMatchesDesign =
+				(nodeName.includes("button") && (element === "button" || ca.role === "button")) ||
+				(nodeName.includes("link") && (element === "a" || ca.role === "link")) ||
+				(nodeName.includes("input") && (element === "input" || element === "textarea")) ||
+				(nodeName.includes("checkbox") && (element === "input" || ca.role === "checkbox")) ||
+				(nodeName.includes("radio") && (element === "input" || ca.role === "radio")) ||
+				(nodeName.includes("switch") && (ca.role === "switch" || element === "input")) ||
+				(nodeName.includes("select") && (element === "select" || ca.role === "listbox")) ||
+				(nodeName.includes("tab") && (ca.role === "tab" || element === "button"));
+
+			if (!elementMatchesDesign) {
+				discrepancies.push({
+					category: "accessibility",
+					property: "semanticElement",
+					severity: "major",
+					designValue: nodeName,
+					codeValue: `<${element}>${ca.role ? ` role="${ca.role}"` : ""}`,
+					message: `Design component "${node.name}" may not match code element <${element}>`,
+					suggestion: `Verify that <${element}> is the correct semantic element for a component named "${node.name}". Use native HTML elements over ARIA roles where possible.`,
+				});
+			}
+		}
+	}
+
+	// ---- 3. Contrast Ratio ----
 	if (ca.contrastRatio !== undefined && ca.contrastRatio < 4.5) {
 		discrepancies.push({
 			category: "accessibility",
@@ -1200,6 +1217,146 @@ function compareAccessibility(node: any, codeSpec: CodeSpec, discrepancies: Pari
 			codeValue: ca.contrastRatio,
 			message: `Contrast ratio ${ca.contrastRatio}:1 fails WCAG AA minimum (4.5:1)`,
 			suggestion: "Increase contrast ratio to at least 4.5:1",
+		});
+	}
+
+	// ---- 4. Focus Indicator Parity ----
+	// Check if design has a focus variant but code doesn't implement focus-visible
+	const variants = node.children || [];
+	const hasFocusVariant = variants.some(
+		(v: any) => /focus|focused/i.test(v.name || ""),
+	);
+
+	if (hasFocusVariant && ca.focusVisible === false) {
+		discrepancies.push({
+			category: "accessibility",
+			property: "focusVisible",
+			severity: "critical",
+			designValue: "focus variant exists",
+			codeValue: "focusVisible: false",
+			message: "Design has a focus variant but code does not implement :focus-visible styles",
+			suggestion: "Add :focus-visible CSS with a visible focus ring matching the design's focus variant (WCAG 2.4.7)",
+		});
+	} else if (!hasFocusVariant && ca.focusVisible === true) {
+		discrepancies.push({
+			category: "accessibility",
+			property: "focusVisible",
+			severity: "minor",
+			designValue: "no focus variant",
+			codeValue: "focusVisible: true",
+			message: "Code implements :focus-visible but design has no focus variant to specify the visual treatment",
+			suggestion: "Add a focus/focused variant in Figma to document the intended focus indicator design",
+		});
+	}
+
+	// ---- 5. Disabled State Parity ----
+	const hasDisabledVariant = variants.some(
+		(v: any) => /disabled|inactive/i.test(v.name || ""),
+	);
+
+	if (hasDisabledVariant && ca.supportsDisabled === false) {
+		discrepancies.push({
+			category: "accessibility",
+			property: "disabled",
+			severity: "major",
+			designValue: "disabled variant exists",
+			codeValue: "supportsDisabled: false",
+			message: "Design has a disabled variant but code does not support disabled/aria-disabled state",
+			suggestion: "Implement disabled or aria-disabled attribute support in the component",
+		});
+	} else if (!hasDisabledVariant && ca.supportsDisabled === true) {
+		discrepancies.push({
+			category: "accessibility",
+			property: "disabled",
+			severity: "minor",
+			designValue: "no disabled variant",
+			codeValue: "supportsDisabled: true",
+			message: "Code supports disabled state but design has no disabled variant",
+			suggestion: "Add a disabled variant in Figma showing the visual treatment for disabled state",
+		});
+	}
+
+	// ---- 6. Error State Parity ----
+	const hasErrorVariant = variants.some(
+		(v: any) => /error|invalid|danger/i.test(v.name || ""),
+	);
+
+	if (hasErrorVariant && ca.supportsError === false) {
+		discrepancies.push({
+			category: "accessibility",
+			property: "errorState",
+			severity: "major",
+			designValue: "error variant exists",
+			codeValue: "supportsError: false",
+			message: "Design has an error variant but code does not support aria-invalid or error messaging",
+			suggestion: "Implement aria-invalid attribute and associated error message (aria-describedby) in the component",
+		});
+	}
+
+	// ---- 7. Required Field Parity ----
+	if (ca.ariaRequired !== undefined) {
+		const hasRequiredVariant = variants.some(
+			(v: any) => /required/i.test(v.name || ""),
+		);
+		const hasRequiredInDescription = descLower.includes("required");
+
+		if (ca.ariaRequired && !hasRequiredVariant && !hasRequiredInDescription) {
+			discrepancies.push({
+				category: "accessibility",
+				property: "required",
+				severity: "minor",
+				designValue: "no required indicator",
+				codeValue: "ariaRequired: true",
+				message: "Code marks field as required but design has no visual required indicator",
+				suggestion: "Add a required indicator (asterisk, label text) in the design and/or a required variant",
+			});
+		}
+	}
+
+	// ---- 8. Target Size Parity ----
+	if (ca.renderedSize) {
+		const [codeWidth, codeHeight] = ca.renderedSize;
+		const designWidth = node.absoluteBoundingBox?.width || node.size?.x;
+		const designHeight = node.absoluteBoundingBox?.height || node.size?.y;
+
+		if (designWidth && designHeight) {
+			// Check if code size is significantly smaller than design (>20% reduction)
+			if (codeWidth < designWidth * 0.8 || codeHeight < designHeight * 0.8) {
+				discrepancies.push({
+					category: "accessibility",
+					property: "targetSize",
+					severity: "major",
+					designValue: `${Math.round(designWidth)}x${Math.round(designHeight)}`,
+					codeValue: `${codeWidth}x${codeHeight}`,
+					message: `Code renders significantly smaller (${codeWidth}x${codeHeight}px) than design (${Math.round(designWidth)}x${Math.round(designHeight)}px)`,
+					suggestion: "Ensure rendered component meets the design's touch target size. Check CSS min-width/min-height.",
+				});
+			}
+			// Check WCAG 2.5.8 minimum (24x24)
+			if (codeWidth < 24 || codeHeight < 24) {
+				discrepancies.push({
+					category: "accessibility",
+					property: "targetSize",
+					severity: "critical",
+					designValue: `${Math.round(designWidth)}x${Math.round(designHeight)}`,
+					codeValue: `${codeWidth}x${codeHeight}`,
+					message: `Code renders below WCAG 2.5.8 minimum (24x24px): ${codeWidth}x${codeHeight}px`,
+					suggestion: "Increase touch target size to at least 24x24px",
+				});
+			}
+		}
+	}
+
+	// ---- 9. Keyboard Interactions ----
+	if (ca.keyboardInteractions && ca.keyboardInteractions.length > 0 && !descLower.includes("keyboard")) {
+		discrepancies.push({
+			category: "accessibility",
+			property: "keyboardInteractions",
+			severity: "info",
+			designValue: null,
+			codeValue: ca.keyboardInteractions.join(", "),
+			message: `Code defines keyboard interactions (${ca.keyboardInteractions.join(", ")}) but design has no keyboard documentation`,
+			suggestion: "Document keyboard interactions in the Figma component description for developer handoff",
 		});
 	}
 }
@@ -1469,6 +1626,54 @@ function buildParityInstruction(
 // Documentation Section Generators
 // ============================================================================
 
+/**
+ * Detect the atomic-design level (atom | molecule | organism | template) of a component
+ * by finding its Figma page and walking the ordered page list back to the nearest
+ * section-divider page (e.g. "ATOMS", "MOLECULES", "ORGANISMS"). Returns null when the
+ * file doesn't use atomic-design page sections or the page can't be resolved — callers
+ * then simply omit the `level` frontmatter. Best-effort and never throws.
+ */
+async function detectAtomicLevel(
+	api: any,
+	fileKey: string,
+	nodeId: string,
+	setNodeId: string | null,
+	_componentMeta?: any,
+	_allComponentsMeta?: any[] | null,
+): Promise<string | null> {
+	try {
+		const targetId = setNodeId || nodeId;
+
+		// Resolve the page the component lives on — independent of library-publish
+		// status (published `containing_frame` metadata is empty for many files).
+		// Requesting the file with `ids` returns every page in document order, but
+		// prunes each page's children to only the path reaching the requested node,
+		// so the single page whose subtree still contains the node is its home page.
+		const pages: any[] = (await api.getFile(fileKey, { ids: [targetId] }))?.document?.children || [];
+		const contains = (n: any): boolean =>
+			n?.id === targetId || (Array.isArray(n?.children) && n.children.some(contains));
+		const idx = pages.findIndex((p) => contains(p));
+		if (idx < 0) return null;
+
+		// Walk back to the nearest atomic-design divider page.
+		const LEVELS: Array<[string, string]> = [
+			["ATOM", "atom"],
+			["MOLECULE", "molecule"],
+			["ORGANISM", "organism"],
+			["TEMPLATE", "template"],
+		];
+		for (let i = idx; i >= 0; i--) {
+			const stripped = (pages[i]?.name || "").toUpperCase().replace(/[^A-Z]/g, "");
+			for (const [marker, level] of LEVELS) {
+				if (stripped.startsWith(marker)) return level;
+			}
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
 function generateFrontmatter(
 	componentName: string,
 	description: string,
@@ -1477,6 +1682,7 @@ function generateFrontmatter(
 	fileUrl: string,
 	codeInfo?: CodeDocInfo,
 	canonicalSource?: "figma" | "code" | "reconciled",
+	level?: string | null,
 ): string {
 	const status = codeInfo?.changelog?.[0]
 		? "stable"
@@ -1485,16 +1691,18 @@ function generateFrontmatter(
 			: "stable";
 	const version = codeInfo?.changelog?.[0]?.version || "1.0.0";
 	const tags = [componentName.toLowerCase()];
+	if (level) tags.push(level);
 	if (node.type === "COMPONENT_SET") tags.push("variants");
 	if (node.componentPropertyDefinitions) tags.push("configurable");
 
 	const lines = [
 		"---",
 		`title: ${componentName}`,
-		`description: ${(description.split(/(?:When to Use|When NOT to Use|Variants|Content Requirements|Accessibility)/i)[0] || description).replace(/\n/g, " ").replace(/\s+/g, " ").trim() || `${componentName} component`}`,
+		`description: ${((description.split(/\n\s*\n|\n#{1,6}\s|\n\*\*/)[0] || description).replace(/\n/g, " ").replace(/\s+/g, " ").trim().split(/(?<=[.!?])\s+/)[0] || `${componentName} component`)}`,
 		`status: ${status}`,
 		`version: ${version}`,
 		`category: components`,
+		...(level ? [`level: ${level}`] : []),
 		`tags: [${tags.join(", ")}]`,
 		`figma: ${fileUrl}`,
 	];
@@ -1782,14 +1990,18 @@ function generateVisualSpecsSection(
 	node: any,
 	enrichedData: EnrichedComponent | null,
 	variantData?: VariantColorData[],
+	varNameMap: Map<string, string> = new Map(),
 ): string {
 	const lines = ["", "## Token Specification", ""];
 
-	// Build variable name lookup from enrichment data
-	const varNameMap = new Map<string, string>();
+	// Fill any gaps in the caller-supplied name map from enrichment data.
+	// enrichment entries key off variableId/variableName (NOT id/name), and only
+	// carry a useful name when it actually resolved (not the raw VariableID).
 	if (enrichedData?.variables_used) {
-		for (const v of enrichedData.variables_used) {
-			varNameMap.set(v.id, v.name);
+		for (const v of enrichedData.variables_used as any[]) {
+			if (v.variableId && v.variableName && v.variableName !== v.variableId && !varNameMap.has(v.variableId)) {
+				varNameMap.set(v.variableId, v.variableName);
+			}
 		}
 	}
 
@@ -1858,7 +2070,7 @@ function generateVisualSpecsSection(
 
 	// Spacing tokens with variable names
 	const visualNode = resolveVisualNode(node);
-	const spacingTokens = collectSpacingTokens(visualNode);
+	const spacingTokens = collectSpacingTokens(visualNode, varNameMap);
 	if (spacingTokens.length > 0) {
 		lines.push("### Spacing Tokens");
 		lines.push("");
@@ -2052,6 +2264,59 @@ function generateAccessibilitySection(
 			}
 		} else {
 			lines.push("_No accessibility annotations found in Figma. Add annotations to the component description._");
+			lines.push("");
+		}
+	}
+
+	return lines.join("\n");
+}
+
+function generateDesignAnnotationsSection(
+	node: any,
+): string {
+	// Annotations come from the Desktop Bridge plugin (node.annotations)
+	// They are available when the component was fetched via Desktop Bridge
+	const annotations: any[] = node.annotations || [];
+
+	if (annotations.length === 0) {
+		return [
+			"",
+			"## Design Annotations",
+			"",
+			"_No design annotations found on this node. Designers can add annotations in Dev Mode to specify animation timings, easing curves, interaction behaviors, and other implementation details._",
+			"_Use `figma_get_annotations` with `include_children=true` to check child nodes for annotations._",
+			"",
+		].join("\n");
+	}
+
+	const lines = ["", "## Design Annotations", ""];
+	lines.push(`Found **${annotations.length}** annotation(s) on this component:`, "");
+
+	for (let i = 0; i < annotations.length; i++) {
+		const ann = annotations[i];
+		const num = i + 1;
+
+		// Header with category if available
+		const categoryLabel = ann.categoryName ? ` (${ann.categoryName})` : (ann.categoryId ? ` (category: ${ann.categoryId})` : "");
+		lines.push(`### Annotation ${num}${categoryLabel}`);
+		lines.push("");
+
+		// Label content
+		if (ann.labelMarkdown) {
+			// Indent markdown content and render it
+			lines.push(ann.labelMarkdown);
+			lines.push("");
+		} else if (ann.label) {
+			lines.push(ann.label);
+			lines.push("");
+		}
+
+		// Pinned properties
+		if (ann.properties && ann.properties.length > 0) {
+			lines.push("**Pinned Properties:**");
+			for (const prop of ann.properties) {
+				lines.push(`- \`${prop.type}\``);
+			}
 			lines.push("");
 		}
 	}
@@ -2325,7 +2590,15 @@ const codeSpecSchema = z.object({
 		keyboardInteractions: z.array(z.string()).optional(),
 		contrastRatio: z.number().optional(),
 		focusVisible: z.boolean().optional(),
-	}).optional().describe("Accessibility properties from code"),
+		semanticElement: z.string().optional().describe("Semantic HTML element (e.g., 'button', 'a', 'input')"),
+		supportsDisabled: z.boolean().optional().describe("Whether code supports disabled/aria-disabled state"),
+		supportsError: z.boolean().optional().describe("Whether code supports aria-invalid/error state"),
+		// NOTE: Use array-with-length, NOT z.tuple — tuples emit JSON Schema `items: [...]`
+		// (array of schemas), which Gemini's stricter Function Calling validator rejects with
+		// "is not of type 'object', 'boolean'". See issue #64. A constrained array emits
+		// `items: { type: 'number' }` which all major MCP clients accept.
+		renderedSize: z.array(z.number()).min(2).max(2).optional().describe("Rendered size [width, height] in px"),
+	}).optional().describe("Accessibility properties from code. Tip: use figma_scan_code_accessibility with mapToCodeSpec:true to auto-generate this from component HTML."),
 	metadata: z.object({
 		name: z.string().optional(),
 		description: z.string().optional(),
@@ -2450,7 +2723,7 @@ export function registerDesignCodeTools(
 				const api = await getFigmaAPI();
 
 				// Fetch component node
-				const nodesResponse = await api.getNodes(fileKey, [nodeId], { depth: 2 });
+				const nodesResponse = await api.getNodes(fileKey, [nodeId], { depth: 4 });
 				const nodeData = nodesResponse?.nodes?.[nodeId];
 				if (!nodeData?.document) {
 					throw new Error(`Node ${nodeId} not found in file ${fileKey}`);
@@ -2523,16 +2796,23 @@ export function registerDesignCodeTools(
 					}
 				}
 
+				// Cast to the structural CodeSpec interface. The Zod schema infers
+				// `accessibility.renderedSize` as `number[]` (post-#64 fix uses
+				// `z.array(z.number()).min(2).max(2)` for Gemini compat), but at runtime
+				// the validator guarantees exactly two numbers, matching CodeSpec's
+				// `[number, number]`. TypeScript can't bridge the inference gap.
+				const codeSpecTyped = codeSpec as CodeSpec;
+
 				// Run all comparators (use nodeForVisual for design properties, nodeForAPI for component API)
 				const discrepancies: ParityDiscrepancy[] = [];
-				compareVisual(nodeForVisual, codeSpec, discrepancies);
-				compareSpacing(nodeForVisual, codeSpec, discrepancies);
-				compareTypography(nodeForVisual, codeSpec, discrepancies);
-				compareTokens(enrichedData, codeSpec, discrepancies);
-				compareComponentAPI(nodeForAPI, codeSpec, discrepancies);
-				compareAccessibility(node, codeSpec, discrepancies);
-				compareNaming(node, codeSpec, discrepancies);
-				compareMetadata(node, componentMeta, codeSpec, discrepancies);
+				compareVisual(nodeForVisual, codeSpecTyped, discrepancies);
+				compareSpacing(nodeForVisual, codeSpecTyped, discrepancies);
+				compareTypography(nodeForVisual, codeSpecTyped, discrepancies);
+				compareTokens(enrichedData, codeSpecTyped, discrepancies);
+				compareComponentAPI(nodeForAPI, codeSpecTyped, discrepancies);
+				compareAccessibility(node, codeSpecTyped, discrepancies);
+				compareNaming(node, codeSpecTyped, discrepancies);
+				compareMetadata(node, componentMeta, codeSpecTyped, discrepancies);
 
 				// Sort by severity
 				const severityOrder: Record<DiscrepancySeverity, number> = {
@@ -2594,7 +2874,7 @@ export function registerDesignCodeTools(
 							: [],
 						tokenCoverage: enrichedData?.token_coverage,
 					},
-					codeData: codeSpec,
+					codeData: codeSpecTyped,
 				};
 
 				return {
@@ -2624,7 +2904,7 @@ export function registerDesignCodeTools(
 	// -----------------------------------------------------------------------
 	server.tool(
 		"figma_generate_component_doc",
-		"Generate AI-complete component documentation from a Figma component. Produces structured markdown with anatomy, per-variant color tokens, typography, content guidelines (parsed from Figma description), icon mapping, spacing tokens, and design-code parity analysis. Merges Figma design data with optional code-side info (CVA definitions, sub-component APIs, source files). Output works with any docs platform. For richest output, read the component source code first and pass codeInfo.",
+		"Generate AI-complete component documentation from a Figma component. Produces structured markdown with anatomy, per-variant color tokens, typography, content guidelines (parsed from Figma description), design annotations (animation timings, interaction specs, accessibility notes from Dev Mode), icon mapping, spacing tokens, and design-code parity analysis. Merges Figma design data with optional code-side info (CVA definitions, sub-component APIs, source files). Output works with any docs platform. For richest output, read the component source code first and pass codeInfo.",
 		{
 			fileUrl: z
 				.string()
@@ -2643,6 +2923,7 @@ export function registerDesignCodeTools(
 				behavior: z.boolean().optional().default(false),
 				implementation: z.boolean().optional().default(true),
 				accessibility: z.boolean().optional().default(true),
+				designAnnotations: z.boolean().optional().default(true),
 				relatedComponents: z.boolean().optional().default(false),
 				changelog: z.boolean().optional().default(true),
 				parity: z.boolean().optional().default(true),
@@ -2750,11 +3031,39 @@ export function registerDesignCodeTools(
 					}
 				}
 
-				// Build variable name lookup for per-variant color collection
+				// Build variable name lookup (id → token name) for per-variant color
+				// AND spacing collection. Two sources, in order of authority:
+				//   1. Desktop Bridge local variables (Plugin API getLocalVariablesAsync) —
+				//      works on EVERY Figma plan and is the only reliable id→name source.
+				//      The REST /files/:key/variables/local endpoint is Enterprise-only
+				//      (returns 403 on all other plans), so enrichment's variable map is
+				//      almost always empty and bound colors would otherwise render as raw
+				//      hex / raw VariableIDs.
+				//   2. Enrichment variables_used — fallback for non-bridge (Cloud/Remote)
+				//      paths. NOTE: entries key off variableId/variableName (NOT id/name),
+				//      and their name is only useful when it actually resolved to a token
+				//      name (not the raw VariableID).
 				const varNameMap = new Map<string, string>();
 				if (enrichedData?.variables_used) {
-					for (const v of enrichedData.variables_used) {
-						varNameMap.set(v.id, v.name);
+					for (const v of enrichedData.variables_used as any[]) {
+						if (v.variableId && v.variableName && v.variableName !== v.variableId) {
+							varNameMap.set(v.variableId, v.variableName);
+						}
+					}
+				}
+				if (getDesktopConnector) {
+					try {
+						const connector = await getDesktopConnector();
+						const varsResult = await connector.getVariables();
+						const varList = varsResult?.variables || varsResult?.result?.variables;
+						if (Array.isArray(varList)) {
+							for (const v of varList) {
+								if (v?.id && v?.name) varNameMap.set(v.id, v.name);
+							}
+							logger.info({ count: varList.length }, "Resolved variable names via Desktop Bridge for docs");
+						}
+					} catch {
+						logger.warn("Could not load bridge variables for doc token names — colors may fall back to hex");
 					}
 				}
 
@@ -2768,21 +3077,31 @@ export function registerDesignCodeTools(
 				// REST API getNodes() often returns empty description for COMPONENT_SET nodes,
 				// so fall back to Desktop Bridge plugin API which has the reliable description.
 				let description = node.descriptionMarkdown || node.description || componentMeta?.description || "";
-				if (!description && getDesktopConnector) {
+				if (getDesktopConnector) {
 					try {
 						const connector = await getDesktopConnector();
 						const bridgeResult = await connector.getComponentFromPluginUI(nodeId);
 						if (bridgeResult.success && bridgeResult.component) {
-							description = bridgeResult.component.descriptionMarkdown || bridgeResult.component.description || "";
-							if (description) {
-								logger.info("Fetched description via Desktop Bridge (REST API returned empty)");
+							// Fetch description from bridge if REST API returned empty
+							if (!description) {
+								description = bridgeResult.component.descriptionMarkdown || bridgeResult.component.description || "";
+								if (description) {
+									logger.info("Fetched description via Desktop Bridge (REST API returned empty)");
+								}
+							}
+							// Always fetch annotations from bridge (REST API never has them)
+							if (bridgeResult.component.annotations && bridgeResult.component.annotations.length > 0) {
+								node.annotations = bridgeResult.component.annotations;
+								logger.info({ count: node.annotations.length }, "Fetched annotations via Desktop Bridge for documentation");
 							}
 						}
 					} catch {
-						logger.warn("Desktop Bridge description fetch failed, proceeding without description");
+						logger.warn("Desktop Bridge fetch failed, proceeding without bridge-sourced data");
 					}
 				}
-				const fileUrl_ = `${url}?node-id=${nodeId.replace(":", "-")}`;
+				// Strip any existing query (e.g. the connected file's ?node-id=<page>) before
+				// appending the target node, otherwise the URL ends up with a doubled ?node-id=.
+				const fileUrl_ = `${url.split("?")[0]}?node-id=${nodeId.replace(":", "-")}`;
 
 				// Parse the component description for structured content
 				const parsedDesc = parseComponentDescription(description);
@@ -2817,7 +3136,8 @@ export function registerDesignCodeTools(
 				const includedSections: string[] = [];
 
 				if (includeFrontmatter) {
-					parts.push(generateFrontmatter(componentName, description, node, componentMeta, fileUrl_, codeInfo, canonicalSource));
+					const atomicLevel = await detectAtomicLevel(api, fileKey, nodeId, setInfo.setNodeId, componentMeta, allComponentsMeta);
+					parts.push(generateFrontmatter(componentName, description, node, componentMeta, fileUrl_, codeInfo, canonicalSource, atomicLevel));
 					parts.push("");
 				}
 
@@ -2843,7 +3163,7 @@ export function registerDesignCodeTools(
 				}
 
 				if (s.visualSpecs) {
-					parts.push(generateVisualSpecsSection(nodeForVisual, enrichedData, variantData));
+					parts.push(generateVisualSpecsSection(nodeForVisual, enrichedData, variantData, varNameMap));
 					includedSections.push("visualSpecs");
 				}
 
@@ -2871,6 +3191,12 @@ export function registerDesignCodeTools(
 				if (s.accessibility) {
 					parts.push(generateAccessibilitySection(node, parsedDesc, codeInfo));
 					includedSections.push("accessibility");
+				}
+
+				if (s.designAnnotations !== false) {
+					const annotationsSection = generateDesignAnnotationsSection(node);
+					parts.push(annotationsSection);
+					includedSections.push("designAnnotations");
 				}
 
 				if (s.parity && hasCodeInfo && hasFigmaData && codeInfo) {

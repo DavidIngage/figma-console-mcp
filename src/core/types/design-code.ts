@@ -80,6 +80,14 @@ export interface CodeSpec {
 		keyboardInteractions?: string[];
 		contrastRatio?: number;
 		focusVisible?: boolean;
+		/** Semantic HTML element used (e.g., 'button', 'a', 'input') */
+		semanticElement?: string;
+		/** Whether component supports disabled state (aria-disabled or disabled attr) */
+		supportsDisabled?: boolean;
+		/** Whether component has error/invalid state (aria-invalid) */
+		supportsError?: boolean;
+		/** Minimum rendered dimensions in px [width, height] */
+		renderedSize?: [number, number];
 	};
 
 	/** Metadata from code */
@@ -238,6 +246,7 @@ export interface DocSections {
 	behavior?: boolean;
 	implementation?: boolean;
 	accessibility?: boolean;
+	designAnnotations?: boolean;
 	relatedComponents?: boolean;
 	changelog?: boolean;
 	parity?: boolean;

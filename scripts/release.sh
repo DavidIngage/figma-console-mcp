@@ -37,6 +37,7 @@ LOCAL_TOOLS=""
 REMOTE_TOOLS=""
 CLOUD_TOOLS=""
 DRY_RUN=false
+GH_RELEASE=""  # "auto" (default), "yes" (--release), "no" (--no-release)
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -45,6 +46,8 @@ while [[ $# -gt 0 ]]; do
     --remote-tools) REMOTE_TOOLS="$2";  shift 2 ;;
     --cloud-tools)  CLOUD_TOOLS="$2";   shift 2 ;;
     --dry-run)      DRY_RUN=true;       shift ;;
+    --release)      GH_RELEASE="yes";   shift ;;
+    --no-release)   GH_RELEASE="no";    shift ;;
     -h|--help)
       echo "Usage: ./scripts/release.sh --version X.Y.Z [--local-tools N] [--remote-tools M] [--cloud-tools C] [--dry-run]"
       echo ""
@@ -54,6 +57,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --remote-tools  Override remote mode tool count (auto-detected if omitted)"
       echo "  --cloud-tools   Override cloud mode tool count (auto-detected if omitted)"
       echo "  --dry-run       Show what would change without modifying files"
+      echo "  --release       Create GitHub Release (auto for minor/major, skip for patch)"
+      echo "  --no-release    Skip GitHub Release creation"
       exit 0
       ;;
     *) echo -e "${RED}Unknown option: $1${NC}"; exit 1 ;;
@@ -72,6 +77,31 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
+# ── npm auth precheck ───────────────────────────────────
+# Granular access tokens cap at 90 days. If the token in ~/.npmrc has
+# expired, every downstream step still runs successfully and we only
+# discover the problem at Phase 5 (`npm publish`) — by which point
+# version bumps, CHANGELOG scaffolding, and the GitHub Release have
+# already happened and need manual cleanup.
+#
+# Fail fast: in non-dry-run mode, verify `npm whoami` resolves before
+# touching any files. Skip the check on --dry-run so previews stay cheap.
+if [[ "$DRY_RUN" == false ]]; then
+  if ! NPM_USER=$(npm whoami 2>/dev/null); then
+    echo -e "${RED}Error: npm authentication failed${NC}"
+    echo ""
+    echo "  ${BOLD}npm whoami${NC} returned 401 — the token in ~/.npmrc is expired or revoked."
+    echo ""
+    echo "  Granular access tokens expire every 90 days (npm's cap)."
+    echo "  Renew at: ${CYAN}https://www.npmjs.com/settings/~/tokens${NC}"
+    echo "  See ${CYAN}.notes/RELEASING.md → Known Issues → npm token rotation${NC} for the full recipe."
+    echo ""
+    echo "  Re-run this script after refreshing the token. No files have been modified yet."
+    exit 1
+  fi
+  echo -e "${CYAN}npm auth:${NC} ${BOLD}$NPM_USER${NC} (verified)"
+fi
+
 # ── Resolve paths ───────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -85,14 +115,19 @@ auto_count_local() {
 }
 
 auto_count_remote() {
-  # Remote/SSE mode: only read-only REST API tools
+  # Remote/SSE mode (no plugin pairing): the REST-API-backed read tools that
+  # work over OAuth alone, without a paired Desktop Bridge plugin. These all
+  # live in figma-tools.ts. This count gets surfaced as the "N read-only
+  # tools" claim across the docs.
   grep -roh '"figma_[a-z_]*"' \
     "$ROOT/src/core/figma-tools.ts" \
     2>/dev/null | sort -u | wc -l | tr -d ' '
 }
 
 auto_count_cloud() {
-  # Cloud mode: write-tools + figma-tools + design-system-tools + comment-tools + design-code-tools + figjam-tools + slides-tools + index.ts cloud-specific
+  # Cloud mode (Cloud Mode after pairing): every registrar invoked by src/index.ts
+  # plus index.ts's own direct tool registrations. Mirror this list with the
+  # actual register*() calls in src/index.ts.
   grep -roh '"fig\(ma\|jam\)_[a-z_]*"' \
     "$ROOT/src/core/write-tools.ts" \
     "$ROOT/src/core/figma-tools.ts" \
@@ -101,6 +136,13 @@ auto_count_cloud() {
     "$ROOT/src/core/design-code-tools.ts" \
     "$ROOT/src/core/figjam-tools.ts" \
     "$ROOT/src/core/slides-tools.ts" \
+    "$ROOT/src/core/annotation-tools.ts" \
+    "$ROOT/src/core/deep-component-tools.ts" \
+    "$ROOT/src/core/version-tools.ts" \
+    "$ROOT/src/core/accessibility-tools.ts" \
+    "$ROOT/src/core/diagnose-tool.ts" \
+    "$ROOT/src/core/tokens-tools.ts" \
+    "$ROOT/src/core/slot-tools.ts" \
     "$ROOT/src/index.ts" \
     2>/dev/null | sort -u | wc -l | tr -d ' '
 }
@@ -204,6 +246,42 @@ replace_in_file "$ROOT/src/index.ts" \
   "version: \"$VERSION\"" \
   "all McpServer + health version strings"
 
+# ── 3c. MCP_VERSION sync in src/core/tokens-tools.ts ───
+# The token sync tools stamp this version into DTCG $extensions.mcpVersion
+# on every export so token files record which MCP build produced them.
+echo -e "${BOLD}3c. src/core/tokens-tools.ts MCP_VERSION${NC}"
+replace_in_file "$ROOT/src/core/tokens-tools.ts" \
+  "const MCP_VERSION = \"[0-9]+\.[0-9]+\.[0-9]+\"" \
+  "const MCP_VERSION = \"$VERSION\"" \
+  "MCP_VERSION constant"
+
+# ── 3b. PLUGIN_VERSION sync in figma-desktop-bridge/code.js ──
+# Bumped ONLY when plugin files actually changed since the last release.
+# When they did change, the bump busts Figma's plugin-file cache and marks
+# older imported plugins stale (issue #62). When they did NOT change
+# (server-only release: deps, docs, server code), the constant must stay
+# put — the server's FILE_INFO handshake compares the plugin's reported
+# version against THIS constant, and bumping it would falsely flag every
+# connected plugin as needing a re-import.
+echo -e "${BOLD}3b. figma-desktop-bridge PLUGIN_VERSION${NC}"
+PLUGIN_FILES_CHANGED=true
+if git -C "$ROOT" rev-parse -q --verify "v$CURRENT_VERSION" > /dev/null 2>&1; then
+  # -I ignores the PLUGIN_VERSION line itself (a prior bump must not read as a
+  # "plugin change" next release) and JS comment lines (comment-only edits
+  # don't require a re-import).
+  if git -C "$ROOT" diff --quiet -I '^var PLUGIN_VERSION' -I '^//' "v$CURRENT_VERSION" -- figma-desktop-bridge/; then
+    PLUGIN_FILES_CHANGED=false
+  fi
+fi
+if $PLUGIN_FILES_CHANGED; then
+  replace_in_file "$ROOT/figma-desktop-bridge/code.js" \
+    "var PLUGIN_VERSION = '[0-9]+\.[0-9]+\.[0-9]+'" \
+    "var PLUGIN_VERSION = '$VERSION'" \
+    "PLUGIN_VERSION constant"
+else
+  echo -e "  ${CYAN}SKIP${NC} figma-desktop-bridge/code.js — no plugin file changes since v$CURRENT_VERSION (server-only release; keeping PLUGIN_VERSION so connected plugins aren't falsely flagged stale)"
+fi
+
 # ── 4. Local tool count (N+ tools) ─────────────────────
 # Matches any number followed by + and "tool(s)" in context of local/full mode
 # Patterns: "60+ tools", "the full 60+", "All 59+ tools", "**59+**"
@@ -239,6 +317,12 @@ for f in "${ALL_DOC_FILES[@]}"; do
     "[0-9]+\+ tool " \
     "${LOCAL_TOOLS}+ tool " \
     "N+ tool (singular)"
+
+  # '<span class="number">N+</span>' — landing page HTML in src/index.ts
+  replace_in_file "$ROOT/$f" \
+    '"number">[0-9]+\+<' \
+    "\"number\">${LOCAL_TOOLS}+<" \
+    'HTML <span class="number">N+</span>'
 done
 
 # ── 5. Remote tool count (read-only SSE mode) ──────────
@@ -282,6 +366,23 @@ for f in "${ALL_DOC_FILES[@]}"; do
     "(${CLOUD_TOOLS} tools)" \
     "(N tools) cloud"
 
+  # CORRECTIVE (must run AFTER the generic rule above): the bottom-line
+  # sentence in mode-comparison.md has three DIFFERENT counts in one line —
+  # "read-only (9 tools) … write access (95 tools) … everything (106 tools)".
+  # The generic rule clobbers all three to the cloud count (shipped wrong in
+  # v1.33.0 and again in v1.33.1's first pass); these anchored rules repair
+  # the remote and local slots. sed -E has no lookbehind, so clobber-then-
+  # correct ordering is the mechanism — do not reorder.
+  replace_in_file "$ROOT/$f" \
+    "read-only \\(([0-9]+) tools\\)" \
+    "read-only (${REMOTE_TOOLS} tools)" \
+    "read-only (N tools) corrective"
+
+  replace_in_file "$ROOT/$f" \
+    "everything \\(([0-9]+) tools\\)" \
+    "everything (${LOCAL_TOOLS} tools)" \
+    "everything (N tools) corrective"
+
   # "N tools including full write" — cloud mode in README
   replace_in_file "$ROOT/$f" \
     "[0-9]+ tools including full write" \
@@ -299,6 +400,21 @@ for f in "${ALL_DOC_FILES[@]}"; do
     "— [0-9]+ tools" \
     "— ${CLOUD_TOOLS} tools" \
     "— N tools"
+
+  # CORRECTIVE (must run AFTER the generic rule above): the three setup
+  # cards in docs/index.mdx each carry a different mode's count; the generic
+  # rule sets all three to the cloud count. Anchor by card label to repair
+  # the NPX (local) and Remote slots. Same clobber-then-correct ordering as
+  # the parenthesized rules — do not reorder.
+  replace_in_file "$ROOT/$f" \
+    "Full capabilities — [0-9]+ tools" \
+    "Full capabilities — ${LOCAL_TOOLS} tools" \
+    "Full capabilities — N tools corrective"
+
+  replace_in_file "$ROOT/$f" \
+    "Quick exploration — [0-9]+ tools" \
+    "Quick exploration — ${REMOTE_TOOLS} tools" \
+    "Quick exploration — N tools corrective"
 done
 
 # ── 7. Lockfile sync ───────────────────────────────────
@@ -352,6 +468,51 @@ ${COMPARISON_LINK}" "$CHANGELOG"
     fi
   fi
   CHANGES+=("CHANGELOG.md: version scaffold")
+fi
+
+# ── Step 9: GitHub Release (optional) ──────────────────
+# Auto-creates for minor/major bumps (x.Y.0 or X.0.0), skips for patches.
+# Override with --release or --no-release.
+PATCH_PART="${VERSION##*.}"
+CREATE_RELEASE=false
+
+if [[ "$GH_RELEASE" == "yes" ]]; then
+  CREATE_RELEASE=true
+elif [[ "$GH_RELEASE" == "no" ]]; then
+  CREATE_RELEASE=false
+elif [[ "$PATCH_PART" == "0" ]]; then
+  # Minor or major release (x.Y.0 or X.0.0) — auto-create
+  CREATE_RELEASE=true
+fi
+
+echo -e "${BOLD}9. GitHub Release${NC}"
+if $CREATE_RELEASE; then
+  if $DRY_RUN; then
+    echo -e "  ${CYAN}WOULD${NC} create GitHub Release v${VERSION} (--latest)"
+  else
+    if command -v gh &>/dev/null; then
+      # Pull release notes from CHANGELOG.md — extract content between this version header and the next
+      RELEASE_NOTES=$(awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found" "$ROOT/CHANGELOG.md" | sed '/^$/d')
+      if [[ -z "$RELEASE_NOTES" ]]; then
+        RELEASE_NOTES="See [CHANGELOG](https://github.com/southleft/figma-console-mcp/blob/main/CHANGELOG.md) for details."
+      fi
+      RELEASE_NOTES="${RELEASE_NOTES}
+
+**${LOCAL_TOOLS}+ tools.** Full changelog: https://github.com/southleft/figma-console-mcp/blob/main/CHANGELOG.md"
+
+      gh release create "v${VERSION}" \
+        -t "v${VERSION}" \
+        --latest \
+        -n "$RELEASE_NOTES" 2>/dev/null && \
+        echo -e "  ${GREEN}DONE${NC} GitHub Release v${VERSION} created" || \
+        echo -e "  ${YELLOW}SKIP${NC} GitHub Release — already exists or gh not authenticated"
+    else
+      echo -e "  ${YELLOW}SKIP${NC} GitHub Release — gh CLI not installed"
+    fi
+  fi
+  CHANGES+=("GitHub Release: v${VERSION}")
+else
+  echo -e "  ${CYAN}SKIP${NC} Patch release — use --release to create anyway"
 fi
 
 # ── Summary ─────────────────────────────────────────────

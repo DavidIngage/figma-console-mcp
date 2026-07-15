@@ -1,7 +1,7 @@
 {
 	"name": "figma-console-mcp",
-	"version": "1.17.4",
-	"description": "MCP server for accessing Figma plugin console logs and screenshots via Cloudflare Workers or local mode",
+	"version": "1.35.0",
+	"description": "The most comprehensive MCP server for Figma — design tokens, variables, components, write tools, version history diff, accessibility audits, FigJam, Slides, and more. Local (WebSocket Desktop Bridge plugin) and Cloudflare Workers (paired + remote) modes.",
 	"type": "module",
 	"main": "dist/local.js",
 	"types": "dist/local.d.ts",
@@ -37,15 +37,18 @@
 		"mcp",
 		"figma",
 		"plugin",
-		"console",
-		"debugging",
+		"design-tokens",
+		"design-systems",
+		"variables",
+		"figjam",
+		"slides",
+		"accessibility",
 		"ai",
 		"anthropic",
 		"claude",
-		"cloudflare",
-		"workers"
+		"cloudflare"
 	],
-	"author": "Your Name",
+	"author": "Southleft",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -59,10 +62,10 @@
 		"@modelcontextprotocol/ext-apps": "^1.0.1",
 		"@modelcontextprotocol/sdk": "^1.26.0",
 		"agents": "^0.7.1",
-		"chrome-remote-interface": "^0.33.2",
+		"axe-core": "^4.11.2",
+		"jsdom": "^29.0.1",
 		"pino": "^9.5.0",
 		"pino-pretty": "^13.0.0",
-		"puppeteer-core": "^23.11.1",
 		"uuid": "^11.0.3",
 		"ws": "^8.19.0",
 		"zod": "^3.25.76"
@@ -70,6 +73,7 @@
 	"devDependencies": {
 		"@biomejs/biome": "^2.2.5",
 		"@types/jest": "^29.5.14",
+		"@types/jsdom": "^28.0.1",
 		"@types/node": "^22.10.2",
 		"@types/uuid": "^10.0.0",
 		"@types/ws": "^8.18.1",
@@ -80,7 +84,7 @@
 		"typescript": "5.9.3",
 		"vite": "^6.0.0",
 		"vite-plugin-singlefile": "^2.0.0",
-		"wrangler": "^4.42.0",
+		"wrangler": "4.72.0",
 		"zod-to-json-schema": "^3.25.1"
 	}
 }
